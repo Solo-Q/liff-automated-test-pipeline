@@ -3,7 +3,13 @@ import path from "node:path";
 
 import { analyzeRepository } from "./analyzer.js";
 import { EXIT_CODES } from "./constants.js";
-import { classifyFeatureTarget, TARGET_TYPES } from "./target-classification.js";
+import {
+  classifyFeatureModule,
+  classifyFeatureTarget,
+  inferDecompositionSource,
+  MODULE_TYPES,
+  TARGET_TYPES,
+} from "./target-classification.js";
 import { ensureDirectory, findFiles, pathExists, readJsonFile, writeJsonFile } from "./utils/fs.js";
 
 const SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]);
@@ -20,6 +26,8 @@ const FEATURE_INCLUDE_PATTERNS = [
   /^src\/routes\/.+\.(js|jsx|ts|tsx|mjs|cjs)$/,
   /^src\/routes\/guards\/.+\.(js|jsx|ts|tsx|mjs|cjs)$/,
   /^src\/hooks\/use(Liff|Auth|Platform|LiffTitle)[^/]*\.(js|jsx|ts|tsx|mjs|cjs)$/,
+  /^src\/features\/auth\/hooks\/use[A-Z][^/]*\.(js|jsx|ts|tsx|mjs|cjs)$/,
+  /^src\/features\/auth\/services\/authFlowService\.(js|jsx|ts|tsx|mjs|cjs)$/,
   /^src\/services\/liffService\.(js|jsx|ts|tsx|mjs|cjs)$/,
   /^src\/services\/api\/lineService\.(js|jsx|ts|tsx|mjs|cjs)$/,
   /^src\/App\.(js|jsx|ts|tsx|mjs|cjs)$/,
@@ -127,7 +135,7 @@ async function loadOrAnalyze(context, logger) {
 
 async function buildFeatureMap(repoPath, sourceFiles, liffUsageReport, existingTestMap) {
   const liffFiles = new Set([...liffUsageReport.importFiles, ...liffUsageReport.directCallFiles]);
-  const features = [];
+  const topLevelFeatures = [];
   const seenIds = new Set();
 
   for (const file of sourceFiles) {
@@ -157,11 +165,25 @@ async function buildFeatureMap(repoPath, sourceFiles, liffUsageReport, existingT
       dependsOnLiff,
       extractionSource,
     });
-    features.push({
+    const moduleType = classifyFeatureModule({
+      name: featureName,
+      files: [file.relativePath],
+      dependsOnLiff,
+      extractionSource,
+      targetType,
+    });
+    topLevelFeatures.push({
       featureId,
       name: featureName,
       files: [file.relativePath],
       targetType,
+      moduleType,
+      parentFeatureId: null,
+      childFeatureIds: [],
+      decompositionSource: inferDecompositionSource({
+        files: [file.relativePath],
+        extractionSource,
+      }),
       dependsOnLiff,
       risk,
       recommendedTests: recommendTests(risk, dependsOnLiff, targetType),
@@ -171,7 +193,108 @@ async function buildFeatureMap(repoPath, sourceFiles, liffUsageReport, existingT
     });
   }
 
+  const features = decomposeFeatureFamilies(topLevelFeatures);
   return features.sort((left, right) => left.featureId.localeCompare(right.featureId));
+}
+
+function decomposeFeatureFamilies(features) {
+  const allFeatures = [...features];
+  const childFeatures = [];
+
+  for (const feature of features) {
+    const children = createChildFeatures(feature);
+    if (children.length === 0) {
+      continue;
+    }
+
+    feature.childFeatureIds = children.map((child) => child.featureId);
+    childFeatures.push(...children);
+  }
+
+  allFeatures.push(...childFeatures);
+  return allFeatures;
+}
+
+function createChildFeatures(feature) {
+  const file = String(feature.files?.[0] ?? "").toLowerCase();
+  const childModules = [];
+
+  if (file.endsWith("/cardholderpage.tsx")) {
+    childModules.push(MODULE_TYPES.SEARCH, MODULE_TYPES.TAB_SWITCH, MODULE_TYPES.COUNT_DISPLAY);
+  }
+
+  if (file.endsWith("/contactdetailpage.tsx")) {
+    childModules.push(
+      MODULE_TYPES.FAVORITE_TOGGLE,
+      MODULE_TYPES.CONTACT_PHONE,
+      MODULE_TYPES.CONTACT_EMAIL,
+      MODULE_TYPES.CONTACT_LINE,
+    );
+  }
+
+  if (file.endsWith("/notificationcenterpage.tsx")) {
+    childModules.push(MODULE_TYPES.NOTIFICATION_MENU, MODULE_TYPES.NOTIFICATION_READ_STATE, MODULE_TYPES.EMPTY_STATE);
+  }
+
+  if (file.endsWith("/phoneverificationpage.tsx")) {
+    childModules.push(MODULE_TYPES.PHONE_VALIDATION);
+  }
+
+  if (file.endsWith("/verificationcodepage.tsx")) {
+    childModules.push(MODULE_TYPES.VERIFICATION_FLOW, MODULE_TYPES.DUPLICATE_CHECK);
+  }
+
+  if (file.endsWith("/cardscannerpage.tsx")) {
+    childModules.push(MODULE_TYPES.SCAN_PERMISSION, MODULE_TYPES.SCAN_QUOTA, MODULE_TYPES.SCAN_FIELD_MAPPING);
+  }
+
+  if (file.endsWith("/membersettingspage.tsx")) {
+    childModules.push(MODULE_TYPES.SETTINGS_VALIDATION, MODULE_TYPES.SETTINGS_FORM);
+  }
+
+  return childModules.map((moduleType) => createChildFeature(feature, moduleType));
+}
+
+function createChildFeature(feature, moduleType) {
+  const featureId = `${feature.featureId}-${moduleType}`;
+  return {
+    ...feature,
+    featureId,
+    name: `${feature.name} ${formatModuleTypeLabel(moduleType)}`,
+    moduleType,
+    parentFeatureId: feature.featureId,
+    childFeatureIds: [],
+    decompositionSource: "qa-module-rule",
+    targetType: feature.targetType,
+    recommendedTests: recommendChildTests(feature, moduleType),
+  };
+}
+
+function recommendChildTests(feature, moduleType) {
+  if (
+    moduleType === MODULE_TYPES.SEARCH ||
+    moduleType === MODULE_TYPES.FAVORITE_TOGGLE ||
+    moduleType === MODULE_TYPES.NOTIFICATION_MENU ||
+    moduleType === MODULE_TYPES.NOTIFICATION_READ_STATE ||
+    moduleType === MODULE_TYPES.DUPLICATE_CHECK ||
+    moduleType === MODULE_TYPES.PHONE_VALIDATION ||
+    moduleType === MODULE_TYPES.SCAN_PERMISSION ||
+    moduleType === MODULE_TYPES.SCAN_QUOTA ||
+    moduleType === MODULE_TYPES.SCAN_FIELD_MAPPING ||
+    moduleType === MODULE_TYPES.SETTINGS_VALIDATION ||
+    moduleType === MODULE_TYPES.SETTINGS_FORM
+  ) {
+    return feature.risk === "high" ? ["unit", "integration"] : ["unit"];
+  }
+
+  return ["unit"];
+}
+
+function formatModuleTypeLabel(moduleType) {
+  return moduleType
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function isEligibleFeatureFile(relativePath, dependsOnLiff) {
@@ -239,7 +362,17 @@ function mapRisk(score) {
 }
 
 function recommendTests(risk, dependsOnLiff, targetType) {
-  if (targetType === TARGET_TYPES.ROUTE_GUARD || targetType === TARGET_TYPES.AUTH_ENTRY_FLOW) {
+  if (
+    targetType === TARGET_TYPES.ROUTE_GUARD ||
+    targetType === TARGET_TYPES.AUTH_ENTRY_FLOW ||
+    targetType === TARGET_TYPES.AUTH_COMPOSITE_HOOK ||
+    targetType === TARGET_TYPES.AUTH_STATE_HOOK ||
+    targetType === TARGET_TYPES.AUTH_BACKEND_FLOW_SERVICE ||
+    targetType === TARGET_TYPES.CARD_SHARE_FLOW_PAGE ||
+    targetType === TARGET_TYPES.SHARE_WORKFLOW_PAGE ||
+    targetType === TARGET_TYPES.CARDHOLDER_PAGE_FLOW ||
+    targetType === TARGET_TYPES.AUTH_ONBOARDING_PAGE
+  ) {
     return risk === "high" ? ["unit", "integration"] : ["unit"];
   }
   if (risk === "high") {

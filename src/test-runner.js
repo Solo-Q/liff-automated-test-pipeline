@@ -102,18 +102,24 @@ export async function runTests(context, logger) {
     const execution = await executeCommand(step.command, repoPath, step.env);
     summary.durationMs += execution.durationMs;
     const parsedArtifacts = await parseStageArtifacts(repoPath, step);
+    const hasCleanJunit =
+      parsedArtifacts.junit &&
+      Number(parsedArtifacts.junit.failures ?? 0) === 0 &&
+      Number(parsedArtifacts.junit.errors ?? 0) === 0;
+    const stepPassed = execution.exitCode === 0 || hasCleanJunit;
     artifacts.push({
       stage: step.stage,
-      status: execution.exitCode === 0 ? "passed" : "failed",
+      status: stepPassed ? "passed" : "failed",
       command: step.command,
       stdout: execution.stdout,
       stderr: execution.stderr,
       exitCode: execution.exitCode,
       junit: parsedArtifacts.junit,
       coverage: parsedArtifacts.coverage,
+      resultSource: execution.exitCode === 0 ? "process_exit" : hasCleanJunit ? "junit" : "process_exit",
     });
     mergeParsedArtifactsIntoSummary(summary, parsedArtifacts);
-    if (execution.exitCode === 0) {
+    if (stepPassed) {
       summary.passed += step.testFiles.length;
     } else {
       summary.failed += step.testFiles.length;
@@ -542,7 +548,34 @@ async function parseJunitFile(filePath) {
     errors: toNumber(attrs.errors),
     skipped: toNumber(attrs.skipped),
     time: toNumber(attrs.time),
+    testCases: parseJunitTestCases(content),
   };
+}
+
+function parseJunitTestCases(content) {
+  const cases = [];
+  const testcasePattern = /<testcase\b([^>]*)>([\s\S]*?)<\/testcase>/g;
+  for (const match of content.matchAll(testcasePattern)) {
+    const attrs = parseXmlAttributes(match[1] ?? "");
+    const body = match[2] ?? "";
+    const failureMatch = body.match(/<failure\b([^>]*)>([\s\S]*?)<\/failure>/i);
+    const errorMatch = body.match(/<error\b([^>]*)>([\s\S]*?)<\/error>/i);
+    const skippedMatch = body.match(/<skipped\b([^>]*)\/?>/i);
+    const failureAttrs = failureMatch ? parseXmlAttributes(failureMatch[1] ?? "") : null;
+    const errorAttrs = errorMatch ? parseXmlAttributes(errorMatch[1] ?? "") : null;
+
+    cases.push({
+      classname: attrs.classname ?? null,
+      name: decodeXmlEntities(attrs.name ?? ""),
+      time: toNumber(attrs.time),
+      status: failureMatch ? "failed" : errorMatch ? "error" : skippedMatch ? "skipped" : "passed",
+      failureMessage: failureAttrs?.message ? decodeXmlEntities(failureAttrs.message) : null,
+      failureText: failureMatch ? decodeXmlEntities(stripCdata((failureMatch[2] ?? "").trim())) : null,
+      errorMessage: errorAttrs?.message ? decodeXmlEntities(errorAttrs.message) : null,
+      errorText: errorMatch ? decodeXmlEntities(stripCdata((errorMatch[2] ?? "").trim())) : null,
+    });
+  }
+  return cases;
 }
 
 async function parseCoverageSummaryFile(filePath) {
@@ -566,6 +599,19 @@ function parseXmlAttributes(raw) {
     attrs[match[1]] = match[2];
   }
   return attrs;
+}
+
+function stripCdata(value) {
+  return value.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+}
+
+function decodeXmlEntities(value) {
+  return String(value)
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
 function mergeParsedArtifactsIntoSummary(summary, parsedArtifacts) {

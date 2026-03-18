@@ -3,6 +3,62 @@ import path from "node:path";
 import { analyzeRepository } from "./analyzer.js";
 import { EXIT_CODES } from "./constants.js";
 import { extractFeatures } from "./feature-extractor.js";
+import {
+  assignGenerationMode,
+  assignPriority,
+  buildScenarioTestData,
+  inferFailureMode,
+} from "./generator/generation-mode-policy.js";
+import { buildManualReferenceIds } from "./generator/manual-reference-registry.js";
+import { buildScenarioPool } from "./generator/scenario-registry.js";
+import { selectSpecializedTemplateBuilder } from "./generator/specialized-template-registry.js";
+import {
+  buildLiffServiceTestContent as buildLiffServiceTestContentFromModule,
+  buildLineServiceTestContent as buildLineServiceTestContentFromModule,
+} from "./generator/builders/service-builders.js";
+import {
+  buildAuthCompositeHookTestContent as buildAuthCompositeHookTestContentFromModule,
+  buildAuthStateHookTestContent as buildAuthStateHookTestContentFromModule,
+  buildLiffHookTestContent as buildLiffHookTestContentFromModule,
+} from "./generator/builders/hook-builders.js";
+import {
+  buildAuthBackendFlowServiceTestContent as buildAuthBackendFlowServiceTestContentFromModule,
+  buildAuthEntryFlowTestContent as buildAuthEntryFlowTestContentFromModule,
+  buildRouteGuardTestContent as buildRouteGuardTestContentFromModule,
+} from "./generator/builders/auth-route-builders.js";
+import {
+  buildBeginnerGuidePageTestContent as buildBeginnerGuidePageTestContentFromModule,
+  buildCardholderDetailPageTestContent as buildCardholderDetailPageTestContentFromModule,
+  buildCardholderMainPageTestContent as buildCardholderMainPageTestContentFromModule,
+  buildCardholderRoutePageTestContent as buildCardholderRoutePageTestContentFromModule,
+  buildCardDetailEntryPageTestContent as buildCardDetailEntryPageTestContentFromModule,
+  buildCardManageShellTestContent as buildCardManageShellTestContentFromModule,
+  buildCardManageWrapperPageTestContent as buildCardManageWrapperPageTestContentFromModule,
+  buildCardShareFlowPageTestContent as buildCardShareFlowPageTestContentFromModule,
+  buildCardWorkspaceTestContent as buildCardWorkspaceTestContentFromModule,
+  buildCreateFirstCardPageTestContent as buildCreateFirstCardPageTestContentFromModule,
+  buildExpiredPointsPageTestContent as buildExpiredPointsPageTestContentFromModule,
+  buildManualCardEditPageTestContent as buildManualCardEditPageTestContentFromModule,
+  buildMyCashMainPageTestContent as buildMyCashMainPageTestContentFromModule,
+  buildMyCashWrapperPageTestContent as buildMyCashWrapperPageTestContentFromModule,
+  buildNotificationCenterPageTestContent as buildNotificationCenterPageTestContentFromModule,
+  buildRegisterSuccessPageTestContent as buildRegisterSuccessPageTestContentFromModule,
+  buildShareWorkflowPageTestContent as buildShareWorkflowPageTestContentFromModule,
+} from "./generator/builders/page-flow-builders.js";
+import {
+  buildCaseBlock,
+  buildImportLines,
+  buildRelativeImportPath,
+  deriveComponentExportName,
+  deriveServiceExportName,
+  indentBlock,
+  inferLevelFromOutputPath,
+  inferLiffCompanionSourceFile,
+  mergeToolOwnedContent,
+  normalizeImportPath,
+  toPosixPath,
+} from "./generator/builder-helpers.js";
+import { PRIORITIES } from "./generator/shared.js";
 import { TARGET_TYPES } from "./target-classification.js";
 import {
   deleteFile,
@@ -142,30 +198,49 @@ function buildGenerationPlan(featureMap, projectProfile) {
 
   for (const feature of featureMap) {
     const levels = Array.isArray(feature.recommendedTests) ? feature.recommendedTests : [];
+    const scenarioPool = buildScenarioPool(feature);
     for (const level of levels) {
       if (level === "e2e" && projectProfile.e2eFramework !== "playwright") {
         continue;
       }
 
-      const scenarioTypes = ["success", "failure"];
-      if (feature.risk !== "low") {
-        scenarioTypes.push("boundary");
-      }
-
-      for (const scenarioType of scenarioTypes) {
+      const scenarios = scenarioPool.filter((scenario) => scenario.levels.includes(level));
+      for (const scenario of scenarios) {
+        const priority = assignPriority(feature, scenario, level);
+        const failureMode = inferFailureMode(feature, scenario);
+        const testData = buildScenarioTestData(feature, scenario);
+        const manualReferenceIds = buildManualReferenceIds(feature, scenario);
+        const generationMode = assignGenerationMode(feature, scenario, level, priority, failureMode, manualReferenceIds);
         plan.push({
-          id: `${feature.featureId}-${level}-${scenarioType}`,
+          id: `${feature.featureId}-${level}-${scenario.scenarioId}`,
           featureId: feature.featureId,
           featureName: feature.name,
           sourceFile: feature.files?.[0] ?? null,
           targetType: feature.targetType ?? TARGET_TYPES.GENERIC,
+          moduleType: feature.moduleType ?? null,
+          parentFeatureId: feature.parentFeatureId ?? null,
           dependsOnLiff: Boolean(feature.dependsOnLiff),
           level,
-          scenarioType,
-          title: buildScenarioTitle(feature.name, level, scenarioType),
-          fixture: pickFixture(feature, scenarioType),
+          priority,
+          generationMode,
+          scenarioId: scenario.scenarioId,
+          scenarioType: scenario.scenarioType,
+          scenarioName: scenario.name,
+          scenarioCategory: scenario.category,
+          failureMode,
+          title: buildScenarioTitle(feature.name, level, scenario),
+          fixture: scenario.fixture,
           outputPath: buildOutputPath(feature.featureId, level, feature.targetType ?? TARGET_TYPES.GENERIC),
-          expectedOutcome: buildExpectedOutcome(feature, scenarioType),
+          featureGoal: buildFeatureGoal(feature),
+          successCriteria: buildSuccessCriteria(feature),
+          preconditions: scenario.preconditions,
+          userActions: scenario.userActions,
+          systemResult: scenario.systemResult,
+          expectedOutcome: scenario.expectedOutcome,
+          testData,
+          manualReferenceIds,
+          allocationReason: buildAllocationReason(level),
+          testQuestion: buildLevelQuestion(level),
         });
       }
     }
@@ -174,31 +249,48 @@ function buildGenerationPlan(featureMap, projectProfile) {
   return plan;
 }
 
-function buildScenarioTitle(featureName, level, scenarioType) {
-  return `${featureName} ${level} ${scenarioType}`;
+function buildScenarioTitle(featureName, level, scenario) {
+  return `${featureName} ${level} ${scenario.scenarioId} ${scenario.name}`;
 }
 
-function pickFixture(feature, scenarioType) {
-  if (scenarioType === "failure") {
-    if (feature.dependsOnLiff) {
-      return "profileFailed";
-    }
-    return "loggedOut";
+function buildFeatureGoal(feature) {
+  if (feature.dependsOnLiff) {
+    return `${feature.name} should complete a LIFF-dependent user flow safely.`;
   }
-  if (scenarioType === "boundary") {
-    return feature.dependsOnLiff ? "tokenExpired" : "loggedOut";
-  }
-  return feature.dependsOnLiff ? "loggedIn" : "loggedOut";
+  return `${feature.name} should complete its primary user flow correctly.`;
 }
 
-function buildExpectedOutcome(feature, scenarioType) {
-  if (scenarioType === "failure") {
-    return [`${feature.name} handles an error state.`];
+function buildSuccessCriteria(feature) {
+  const criteria = [
+    `${feature.name} renders or completes without unexpected errors.`,
+  ];
+  if (feature.dependsOnLiff) {
+    criteria.push(`${feature.name} handles LIFF state and user context correctly.`);
   }
-  if (scenarioType === "boundary") {
-    return [`${feature.name} handles an edge case safely.`];
+  if (feature.risk !== "low") {
+    criteria.push(`${feature.name} preserves safe behavior under fallback or edge conditions.`);
   }
-  return [`${feature.name} completes the happy path.`];
+  return criteria;
+}
+
+function buildAllocationReason(level) {
+  if (level === "unit") {
+    return "Validate feature rules, state transitions, and local rendering decisions.";
+  }
+  if (level === "integration") {
+    return "Validate page, state, router, API, and LIFF mocks working together.";
+  }
+  return "Validate that the user journey can complete through the main entry path.";
+}
+
+function buildLevelQuestion(level) {
+  if (level === "unit") {
+    return "Is the feature logic itself correct?";
+  }
+  if (level === "integration") {
+    return "Do the integrated modules run correctly together?";
+  }
+  return "Can the user complete the core journey?";
 }
 
 function buildOutputPath(featureId, level, targetType = TARGET_TYPES.GENERIC) {
@@ -210,7 +302,15 @@ function buildOutputPath(featureId, level, targetType = TARGET_TYPES.GENERIC) {
 }
 
 function usesJsxTemplate(targetType) {
-  return targetType === TARGET_TYPES.ROUTE_GUARD || targetType === TARGET_TYPES.AUTH_ENTRY_FLOW;
+  return targetType === TARGET_TYPES.ROUTE_GUARD ||
+    targetType === TARGET_TYPES.AUTH_ENTRY_FLOW ||
+    targetType === TARGET_TYPES.CARD_SHARE_FLOW_PAGE ||
+    targetType === TARGET_TYPES.SHARE_WORKFLOW_PAGE ||
+    targetType === TARGET_TYPES.MYCASH_PAGE_FLOW ||
+    targetType === TARGET_TYPES.CARD_MANAGE_PAGE_FLOW ||
+    targetType === TARGET_TYPES.CARD_DETAIL_FLOW_PAGE ||
+    targetType === TARGET_TYPES.CARDHOLDER_PAGE_FLOW ||
+    targetType === TARGET_TYPES.AUTH_ONBOARDING_PAGE;
 }
 
 async function ensureGeneratedFiles(repoPath, generationPlan, projectProfile, dryRun) {
@@ -252,7 +352,10 @@ async function ensureGeneratedFiles(repoPath, generationPlan, projectProfile, dr
       continue;
     }
 
-    const updatedContent = mergeToolOwnedContent(currentContent, nextContent);
+    const updatedContent = mergeToolOwnedContent(currentContent, nextContent, {
+      MANUAL_START,
+      MANUAL_END,
+    });
     if (updatedContent === currentContent) {
       mutations.push({
         path: relativePath,
@@ -322,10 +425,17 @@ function buildGeneratedTestContent(relativePath, items, projectProfile) {
   }
 
   const importLines = buildImportLines(relativePath, level, projectProfile);
-  const caseBlocks = items.map((item) => buildCaseBlock(item, level)).join("\n\n");
+  const suiteName = items[0]?.featureName ?? items[0]?.featureId ?? relativePath;
+  const caseBlocks = indentBlock(items.map((item) => buildCaseBlock(item, level)).join("\n\n"), 2);
 
   return `${TOOL_SIGNATURE}
 ${importLines}
+describe("${suiteName}", () => {
+  beforeEach(() => {
+    resetLiffFixture();
+    applyLiffFixture("loggedOut");
+  });
+
 ${AUTOGEN_START}
 ${caseBlocks}
 ${AUTOGEN_END}
@@ -333,859 +443,62 @@ ${AUTOGEN_END}
 ${MANUAL_START}
 // custom cases
 ${MANUAL_END}
+});
 `;
 }
 
 function buildSpecializedTestContent(relativePath, items, projectProfile, level) {
-  if (projectProfile.unitTestFramework !== "vitest") {
-    return null;
-  }
-
   const targetType = items[0]?.targetType;
   const sourceFile = items[0]?.sourceFile;
-  if (!sourceFile || !targetType || targetType === TARGET_TYPES.GENERIC) {
-    return null;
-  }
-
-  if (targetType === TARGET_TYPES.LIFF_ADAPTER_SERVICE) {
-    return buildLiffServiceTestContent(relativePath, items, sourceFile);
-  }
-
-  if (targetType === TARGET_TYPES.LINE_SHARE_SERVICE) {
-    return buildLineServiceTestContent(relativePath, items, sourceFile);
-  }
-
-  if (targetType === TARGET_TYPES.LIFF_HOOK) {
-    return buildLiffHookTestContent(relativePath, items, sourceFile);
-  }
-
-  if (targetType === TARGET_TYPES.ROUTE_GUARD) {
-    return buildRouteGuardTestContent(relativePath, items, sourceFile);
-  }
-
-  if (targetType === TARGET_TYPES.AUTH_ENTRY_FLOW) {
-    return buildAuthEntryFlowTestContent(relativePath, items, sourceFile);
-  }
-
-  return null;
-}
-
-function buildLiffServiceTestContent(relativePath, items, sourceFile) {
-  const applyFixtureImportPath = buildRelativeImportPath(relativePath, "testing/liff/applyFixture");
-  const resetFixtureImportPath = buildRelativeImportPath(relativePath, "testing/liff/resetFixture");
-  const sourceImportPath = buildRelativeImportPath(relativePath, sourceFile.replace(/\.[^.]+$/, ""));
-  const serviceExportName = deriveServiceExportName(sourceFile);
-
-  return `${TOOL_SIGNATURE}
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { applyLiffFixture, getCurrentLiffFixture } from "${applyFixtureImportPath}";
-import { resetLiffFixture } from "${resetFixtureImportPath}";
-
-const { liffMock, logServiceMock, canRedirectAfterLoginMock } = vi.hoisted(() => ({
-  liffMock: {
-    init: vi.fn(),
-    isLoggedIn: vi.fn(),
-    getProfile: vi.fn(),
-    getIDToken: vi.fn(),
-    getAccessToken: vi.fn(),
-    login: vi.fn(),
-    logout: vi.fn(),
-    shareTargetPicker: vi.fn(),
-    scanCode: vi.fn(),
-    openWindow: vi.fn(),
-    getContext: vi.fn(),
-    isInClient: vi.fn(),
-    closeWindow: vi.fn(),
-    getLanguage: vi.fn(),
-    getVersion: vi.fn(),
-    getOS: vi.fn(),
-    getLineVersion: vi.fn(),
-    getFriendship: vi.fn(),
-  },
-  logServiceMock: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-  canRedirectAfterLoginMock: vi.fn(),
-}));
-
-vi.mock("@line/liff", () => ({ default: liffMock }));
-vi.mock("@/services/logService", () => ({ logService: logServiceMock }));
-vi.mock("@/constants/liff", () => ({
-  LIFF_CONFIG: {
-    LIFF_ID: "mock-liff-id",
-  },
-}));
-vi.mock("@/features/auth/utils/redirectHelpers", () => ({
-  canRedirectAfterLogin: canRedirectAfterLoginMock,
-}));
-
-import { ${serviceExportName} } from "${sourceImportPath}";
-
-describe("${items[0]?.featureName ?? "Liff Service"}", () => {
-  beforeEach(() => {
-    resetLiffFixture();
-    applyLiffFixture("loggedOut");
-    vi.clearAllMocks();
-    canRedirectAfterLoginMock.mockReturnValue(true);
-    liffMock.init.mockImplementation(async () => {
-      const fixture = getCurrentLiffFixture();
-      if (fixture.initError) {
-        throw new Error(String(fixture.initError));
-      }
-    });
-    liffMock.isLoggedIn.mockImplementation(() => Boolean(getCurrentLiffFixture().isLoggedIn));
-    liffMock.getProfile.mockImplementation(async () => {
-      const fixture = getCurrentLiffFixture();
-      if (fixture.profileError) {
-        throw new Error(String(fixture.profileError));
-      }
-      return fixture.profile ?? {
-        userId: "U1234567890",
-        displayName: "Mock User",
-      };
-    });
-    liffMock.getIDToken.mockImplementation(() => getCurrentLiffFixture().idToken ?? null);
-    liffMock.getAccessToken.mockImplementation(() => getCurrentLiffFixture().accessToken ?? null);
-    liffMock.login.mockResolvedValue(undefined);
-    liffMock.logout.mockImplementation(() => undefined);
-    liffMock.shareTargetPicker.mockResolvedValue({ status: "success" });
-    liffMock.scanCode.mockResolvedValue({ value: "mock-qr" });
-    liffMock.openWindow.mockResolvedValue(undefined);
-    liffMock.getContext.mockReturnValue({ type: "utou" });
-    liffMock.isInClient.mockImplementation(() => Boolean(getCurrentLiffFixture().isInClient));
-    liffMock.closeWindow.mockImplementation(() => undefined);
-    liffMock.getLanguage.mockReturnValue("zh-TW");
-    liffMock.getVersion.mockReturnValue("2.0.0");
-    liffMock.getOS.mockReturnValue("ios");
-    liffMock.getLineVersion.mockReturnValue("14.0.0");
-    liffMock.getFriendship.mockResolvedValue({ friendFlag: true });
-    resetLiffServiceState();
-  });
-
-${AUTOGEN_START}
-${items.map((item) => buildLiffServiceCaseBlock(item, serviceExportName)).join("\n\n")}
-${AUTOGEN_END}
-
-${MANUAL_START}
-// custom cases
-${MANUAL_END}
-});
-
-function resetLiffServiceState() {
-  const state = ${serviceExportName} as unknown as {
-    isInitialized: boolean
-    isLoggedIn: boolean
-    initializingPromise: Promise<boolean> | null
-  };
-  state.isInitialized = false;
-  state.isLoggedIn = false;
-  state.initializingPromise = null;
-}
-`;
-}
-
-function buildLiffServiceCaseBlock(item, serviceExportName) {
-  if (item.scenarioType === "success") {
-    return `it("${item.title}", async () => {
-  applyLiffFixture("${item.fixture}");
-
-  await expect(${serviceExportName}.initialize()).resolves.toBe(true);
-
-  expect(liffMock.init).toHaveBeenCalledWith(expect.objectContaining({
-    liffId: expect.any(String),
-    withLoginOnExternalBrowser: true,
-  }));
-  expect(${serviceExportName}.isUserLoggedIn()).toBe(true);
-});`;
-  }
-
-  if (item.scenarioType === "failure") {
-    return `it("${item.title}", async () => {
-  applyLiffFixture("${item.fixture}");
-  const state = ${serviceExportName} as unknown as { isInitialized: boolean; isLoggedIn: boolean };
-  state.isInitialized = true;
-  state.isLoggedIn = true;
-
-  await expect(${serviceExportName}.getUserProfile()).rejects.toThrow("Failed to load profile");
-  expect(logServiceMock.error).toHaveBeenCalled();
-});`;
-  }
-
-  return `it("${item.title}", async () => {
-  applyLiffFixture("${item.fixture}");
-  const state = ${serviceExportName} as unknown as { isInitialized: boolean; isLoggedIn: boolean };
-  state.isInitialized = true;
-  state.isLoggedIn = true;
-
-  await expect(${serviceExportName}.getIdToken()).resolves.toBeNull();
-});`;
-}
-
-function buildLineServiceTestContent(relativePath, items, sourceFile) {
-  const applyFixtureImportPath = buildRelativeImportPath(relativePath, "testing/liff/applyFixture");
-  const resetFixtureImportPath = buildRelativeImportPath(relativePath, "testing/liff/resetFixture");
-  const lineServiceImportPath = buildRelativeImportPath(relativePath, sourceFile.replace(/\.[^.]+$/, ""));
-  const liffServiceSourceFile = inferLiffCompanionSourceFile(items, sourceFile);
-  const liffServiceImportPath = buildRelativeImportPath(relativePath, liffServiceSourceFile.replace(/\.[^.]+$/, ""));
-  const lineServiceExportName = deriveServiceExportName(sourceFile);
-  const liffServiceExportName = deriveServiceExportName(liffServiceSourceFile);
-
-  return `${TOOL_SIGNATURE}
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { applyLiffFixture, getCurrentLiffFixture } from "${applyFixtureImportPath}";
-import { resetLiffFixture } from "${resetFixtureImportPath}";
-
-const { liffMock, logServiceMock } = vi.hoisted(() => ({
-  liffMock: {
-    init: vi.fn(),
-    isLoggedIn: vi.fn(),
-    getProfile: vi.fn(),
-    getIDToken: vi.fn(),
-    getAccessToken: vi.fn(),
-    login: vi.fn(),
-    logout: vi.fn(),
-    shareTargetPicker: vi.fn(),
-    sendMessages: vi.fn(),
-    isApiAvailable: vi.fn(),
-    getContext: vi.fn(),
-    getOS: vi.fn(),
-    getLanguage: vi.fn(),
-    getAppLanguage: vi.fn(),
-  },
-  logServiceMock: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-vi.mock("@line/liff", () => ({ default: liffMock }));
-vi.mock("../logService", () => ({ logService: logServiceMock }));
-vi.mock("../../services/logService", () => ({ logService: logServiceMock }));
-vi.mock("@/services/logService", () => ({ logService: logServiceMock }));
-vi.mock("@/constants/liff", () => ({
-  LIFF_CONFIG: {
-    LIFF_ID: "mock-liff-id",
-  },
-}));
-
-import { ${lineServiceExportName} } from "${lineServiceImportPath}";
-import { ${liffServiceExportName} } from "${liffServiceImportPath}";
-
-describe("${items[0]?.featureName ?? "Line Service"}", () => {
-  beforeEach(() => {
-    resetLiffFixture();
-    applyLiffFixture("loggedOut");
-    vi.clearAllMocks();
-    liffMock.init.mockImplementation(async () => undefined);
-    liffMock.isLoggedIn.mockImplementation(() => Boolean(getCurrentLiffFixture().isLoggedIn));
-    liffMock.getProfile.mockImplementation(async () => {
-      const fixture = getCurrentLiffFixture();
-      if (fixture.profileError) {
-        throw new Error(String(fixture.profileError));
-      }
-      return fixture.profile ?? {
-        userId: "U1234567890",
-        displayName: "Mock User",
-      };
-    });
-    liffMock.getIDToken.mockImplementation(() => getCurrentLiffFixture().idToken ?? null);
-    liffMock.getAccessToken.mockImplementation(() => getCurrentLiffFixture().accessToken ?? null);
-    liffMock.login.mockResolvedValue(undefined);
-    liffMock.logout.mockImplementation(() => undefined);
-    liffMock.shareTargetPicker.mockResolvedValue({ status: "success" });
-    liffMock.sendMessages.mockResolvedValue(undefined);
-    liffMock.isApiAvailable.mockReturnValue(true);
-    liffMock.getContext.mockReturnValue({ type: "utou" });
-    liffMock.getOS.mockReturnValue("ios");
-    liffMock.getLanguage.mockReturnValue("zh-TW");
-    liffMock.getAppLanguage.mockReturnValue("zh-TW");
-    resetLiffServiceState();
-    vi.stubGlobal("open", vi.fn(() => ({
-      document: {
-        write: vi.fn(),
-        close: vi.fn(),
-      },
-    })));
-  });
-
-${AUTOGEN_START}
-${items.map((item) => buildLineServiceCaseBlock(item, lineServiceExportName, liffServiceExportName)).join("\n\n")}
-${AUTOGEN_END}
-
-${MANUAL_START}
-// custom cases
-${MANUAL_END}
-});
-
-function createMockCard() {
-  return {
-    id: "card-1",
-    userId: "user-1",
-    name: "Mock User",
-    title: "Engineer",
-    company: "OpenAI",
-    email: "mock@example.com",
-    phone: "0912345678",
-    isPublic: true,
-    isDefault: true,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z",
-  };
-}
-
-function resetLiffServiceState() {
-  const state = ${liffServiceExportName} as unknown as {
-    isInitialized: boolean
-    isLoggedIn: boolean
-    initializingPromise: Promise<boolean> | null
-  };
-  state.isInitialized = false;
-  state.isLoggedIn = false;
-  state.initializingPromise = null;
-}
-`;
-}
-
-function buildLineServiceCaseBlock(item, lineServiceExportName, liffServiceExportName) {
-  if (item.scenarioType === "success") {
-    return `it("${item.title}", async () => {
-  applyLiffFixture("${item.fixture}");
-  const state = ${liffServiceExportName} as unknown as { isInitialized: boolean; isLoggedIn: boolean };
-  state.isInitialized = true;
-  state.isLoggedIn = true;
-
-  await expect(${lineServiceExportName}.shareLINEFlexMessage(createMockCard() as never)).resolves.toBeUndefined();
-  expect(liffMock.shareTargetPicker).toHaveBeenCalledTimes(1);
-});`;
-  }
-
-  if (item.scenarioType === "failure") {
-    return `it("${item.title}", async () => {
-  applyLiffFixture("${item.fixture}");
-
-  await expect(${lineServiceExportName}.getLineProfile()).resolves.toBeNull();
-});`;
-  }
-
-  return `it("${item.title}", () => {
-  liffMock.getOS.mockImplementation(() => {
-    throw new Error("env unavailable");
-  });
-
-  expect(${lineServiceExportName}.getEnvironment()).toBe("external");
-  expect(logServiceMock.error).toHaveBeenCalled();
-});`;
-}
-
-function buildLiffHookTestContent(relativePath, items, sourceFile) {
-  const hookImportPath = buildRelativeImportPath(relativePath, sourceFile.replace(/\.[^.]+$/, ""));
-  const hookExportName = deriveServiceExportName(sourceFile);
-
-  return `${TOOL_SIGNATURE}
-import { renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const { liffContextMock, liffServiceMock, logServiceMock } = vi.hoisted(() => ({
-  liffContextMock: {
-    isInitialized: true,
-    isLoggedIn: true,
-    isInLineClient: true,
-    isLoading: false,
-    error: null,
-    profile: {
-      userId: "U1234567890",
-      displayName: "Mock User",
-      pictureUrl: null,
-      statusMessage: null,
+  const builder = selectSpecializedTemplateBuilder({
+    projectProfile,
+    targetType,
+    sourceFile,
+    parentFeatureId: items[0]?.parentFeatureId,
+    builders: {
+      liffAdapterService: buildLiffServiceTestContentFromModule,
+      lineShareService: buildLineServiceTestContentFromModule,
+      myCashWrapperPage: buildMyCashWrapperPageTestContentFromModule,
+      myCashMainPage: buildMyCashMainPageTestContentFromModule,
+      beginnerGuidePage: buildBeginnerGuidePageTestContentFromModule,
+      expiredPointsPage: buildExpiredPointsPageTestContentFromModule,
+      cardManageWrapperPage: buildCardManageWrapperPageTestContentFromModule,
+      cardManageShell: buildCardManageShellTestContentFromModule,
+      cardWorkspace: buildCardWorkspaceTestContentFromModule,
+      cardDetailEntryPage: buildCardDetailEntryPageTestContentFromModule,
+      cardholderMainPage: buildCardholderMainPageTestContentFromModule,
+      cardholderRoutePage: buildCardholderRoutePageTestContentFromModule,
+      manualCardEditPage: buildManualCardEditPageTestContentFromModule,
+      notificationCenterPage: buildNotificationCenterPageTestContentFromModule,
+      cardholderDetailPage: buildCardholderDetailPageTestContentFromModule,
+      createFirstCardPage: buildCreateFirstCardPageTestContentFromModule,
+      registerSuccessPage: buildRegisterSuccessPageTestContentFromModule,
+      liffHook: buildLiffHookTestContentFromModule,
+      authStateHook: buildAuthStateHookTestContentFromModule,
+      authCompositeHook: buildAuthCompositeHookTestContentFromModule,
+      authBackendFlowService: buildAuthBackendFlowServiceTestContentFromModule,
+      routeGuard: buildRouteGuardTestContentFromModule,
+      authEntryFlow: buildAuthEntryFlowTestContentFromModule,
+      cardShareFlowPage: buildCardShareFlowPageTestContentFromModule,
+      shareWorkflowPage: buildShareWorkflowPageTestContentFromModule,
     },
-    initialize: vi.fn(),
-    login: vi.fn(),
-    logout: vi.fn(),
-  },
-  liffServiceMock: {
-    getIsInitialized: vi.fn(),
-    isInExternalBrowser: vi.fn(),
-    getContext: vi.fn(),
-    getLanguage: vi.fn(),
-    getVersion: vi.fn(),
-    getOS: vi.fn(),
-    getLineVersion: vi.fn(),
-    getUserProfile: vi.fn(),
-    shareMessage: vi.fn(),
-    scanQRCode: vi.fn(),
-    openExternalBrowser: vi.fn(),
-    getIdToken: vi.fn(),
-    getAccessToken: vi.fn(),
-    isFeatureAvailable: vi.fn(),
-  },
-  logServiceMock: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-vi.mock("@/components/common/LiffProvider", () => ({
-  useLiffContext: () => liffContextMock,
-}));
-vi.mock("@/services/liffService", () => ({
-  liffService: liffServiceMock,
-}));
-vi.mock("@/services/logService", () => ({
-  logService: logServiceMock,
-}));
-vi.mock("@/constants/liff", () => ({
-  LIFF_FEATURES: {
-    shareMessage: true,
-    scanCode: true,
-  },
-}));
-
-import { ${hookExportName} } from "${hookImportPath}";
-
-describe("${items[0]?.featureName ?? hookExportName}", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    Object.assign(liffContextMock, {
-      isInitialized: true,
-      isLoggedIn: true,
-      isInLineClient: true,
-      isLoading: false,
-      error: null,
-      profile: {
-        userId: "U1234567890",
-        displayName: "Mock User",
-        pictureUrl: null,
-        statusMessage: null,
-      },
-    });
-    liffServiceMock.getIsInitialized.mockReturnValue(true);
-    liffServiceMock.isInExternalBrowser.mockReturnValue(false);
-    liffServiceMock.getContext.mockReturnValue({ type: "utou" });
-    liffServiceMock.getLanguage.mockReturnValue("zh-TW");
-    liffServiceMock.getVersion.mockReturnValue("2.0.0");
-    liffServiceMock.getOS.mockReturnValue("ios");
-    liffServiceMock.getLineVersion.mockReturnValue("14.0.0");
-    liffServiceMock.getUserProfile.mockResolvedValue({
-      userId: "U1234567890",
-      displayName: "Mock User",
-    });
-    liffServiceMock.shareMessage.mockResolvedValue(true);
-    liffServiceMock.scanQRCode.mockResolvedValue("mock-qr");
-    liffServiceMock.openExternalBrowser.mockResolvedValue(undefined);
-    liffServiceMock.getIdToken.mockResolvedValue("mock-id-token");
-    liffServiceMock.getAccessToken.mockResolvedValue("mock-access-token");
-    liffServiceMock.isFeatureAvailable.mockReturnValue(true);
   });
 
-${AUTOGEN_START}
-${items.map((item) => buildLiffHookCaseBlock(item, hookExportName)).join("\n\n")}
-${AUTOGEN_END}
-
-${MANUAL_START}
-// custom cases
-${MANUAL_END}
-});
-`;
-}
-
-function buildLiffHookCaseBlock(item, hookExportName) {
-  if (item.scenarioType === "success") {
-    return `it("${item.title}", () => {
-  const { result } = renderHook(() => ${hookExportName}());
-
-  expect(result.current.isInitialized).toBe(true);
-  expect(result.current.isLoggedIn).toBe(true);
-  expect(result.current.language).toBe("zh-TW");
-});`;
-  }
-
-  if (item.scenarioType === "failure") {
-    return `it("${item.title}", async () => {
-  liffServiceMock.getUserProfile.mockRejectedValueOnce(new Error("profile failed"));
-  const { result } = renderHook(() => ${hookExportName}());
-
-  await expect(result.current.loadUserProfile()).rejects.toThrow("profile failed");
-  expect(logServiceMock.error).toHaveBeenCalled();
-});`;
-  }
-
-  return `it("${item.title}", () => {
-  liffContextMock.isInitialized = false;
-  const { result } = renderHook(() => ${hookExportName}());
-
-  expect(result.current.isFeatureAvailable("shareMessage")).toBe(false);
-});`;
-}
-
-function buildRouteGuardTestContent(relativePath, items, sourceFile) {
-  const guardImportPath = buildRelativeImportPath(relativePath, sourceFile.replace(/\.[^.]+$/, ""));
-  const guardExportName = deriveComponentExportName(sourceFile);
-
-  return `${TOOL_SIGNATURE}
-import React from "react";
-import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const { useAuthMock, useLocationMock, canRedirectAfterLoginMock, logServiceMock } = vi.hoisted(() => ({
-  useAuthMock: vi.fn(),
-  useLocationMock: vi.fn(),
-  canRedirectAfterLoginMock: vi.fn(),
-  logServiceMock: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key) => key }),
-}));
-vi.mock("react-router-dom", () => ({
-  Navigate: ({ to }) => <div data-testid="navigate" data-to={to} />,
-  useLocation: () => useLocationMock(),
-}));
-vi.mock("@/hooks/useAuth", () => ({
-  useAuth: () => useAuthMock(),
-}));
-vi.mock("@/features/auth/utils/redirectHelpers", () => ({
-  canRedirectAfterLogin: canRedirectAfterLoginMock,
-}));
-vi.mock("@/services/logService", () => ({
-  logService: logServiceMock,
-}));
-vi.mock("@/components/common/LoadingSpinner", () => ({
-  LoadingSpinner: ({ text }) => <div>{text}</div>,
-}));
-vi.mock("../paths", () => ({
-  ROUTE_PATHS: {
-    HOME: "/",
-    PHONE_VERIFICATION: "/phone-verification",
-  },
-}));
-
-import { ${guardExportName} } from "${guardImportPath}";
-
-describe("${items[0]?.featureName ?? guardExportName}", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    useLocationMock.mockReturnValue({ pathname: "/cardmanage", search: "" });
-    canRedirectAfterLoginMock.mockReturnValue(true);
-    useAuthMock.mockReturnValue({
-      isAuthenticated: true,
-      hasCompletedPhoneVerification: true,
-      isLoading: false,
-      isLiffInitialized: true,
-      isLiffLoggedIn: true,
-      performBackendAuth: vi.fn(),
-    });
-  });
-
-${AUTOGEN_START}
-${items.map((item) => buildRouteGuardCaseBlock(item, guardExportName)).join("\n\n")}
-${AUTOGEN_END}
-
-${MANUAL_START}
-// custom cases
-${MANUAL_END}
-});
-`;
-}
-
-function buildRouteGuardCaseBlock(item, guardExportName) {
-  if (item.scenarioType === "success") {
-    return `it("${item.title}", () => {
-  render(<${guardExportName}><div>protected content</div></${guardExportName}>);
-
-  expect(screen.getByText("protected content")).toBeInTheDocument();
-});`;
-  }
-
-  if (item.scenarioType === "failure") {
-    return `it("${item.title}", () => {
-  useAuthMock.mockReturnValue({
-    isAuthenticated: false,
-    hasCompletedPhoneVerification: false,
-    isLoading: false,
-    isLiffInitialized: true,
-    isLiffLoggedIn: false,
-    performBackendAuth: vi.fn(),
-  });
-  render(<${guardExportName}><div>protected content</div></${guardExportName}>);
-
-  expect(screen.getByTestId("navigate")).toBeInTheDocument();
-});`;
-  }
-
-  return `it("${item.title}", () => {
-  useAuthMock.mockReturnValue({
-    isAuthenticated: false,
-    hasCompletedPhoneVerification: false,
-    isLoading: true,
-    isLiffInitialized: false,
-    isLiffLoggedIn: false,
-    performBackendAuth: vi.fn(),
-  });
-  render(<${guardExportName}><div>protected content</div></${guardExportName}>);
-
-  expect(screen.getByText("common.authVerifying")).toBeInTheDocument();
-});`;
-}
-
-function buildAuthEntryFlowTestContent(relativePath, items, sourceFile) {
-  const pageImportPath = buildRelativeImportPath(relativePath, sourceFile.replace(/\.[^.]+$/, ""));
-  const pageExportName = deriveComponentExportName(sourceFile);
-
-  return `${TOOL_SIGNATURE}
-import React from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const { navigateMock, dispatchMock, selectorMock, toastShowMock, liffServiceMock, loginWithScopeIdMock, logServiceMock } = vi.hoisted(() => ({
-  navigateMock: vi.fn(),
-  dispatchMock: vi.fn(),
-  selectorMock: vi.fn(),
-  toastShowMock: vi.fn(),
-  liffServiceMock: {
-    initialize: vi.fn(),
-    isUserLoggedIn: vi.fn(),
-    login: vi.fn(),
-    getUserProfile: vi.fn(),
-    getIdToken: vi.fn(),
-  },
-  loginWithScopeIdMock: vi.fn(),
-  logServiceMock: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-vi.mock("antd-mobile", () => ({
-  Toast: { show: toastShowMock },
-}));
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key) => key }),
-}));
-vi.mock("react-router-dom", () => ({
-  useNavigate: () => navigateMock,
-}));
-vi.mock("@/app/hooks", () => ({
-  useAppDispatch: () => dispatchMock,
-  useAppSelector: () => selectorMock(),
-}));
-vi.mock("@/components/common/Button", () => ({
-  default: ({ children, onClick, disabled }) => <button onClick={onClick} disabled={disabled}>{children}</button>,
-}));
-vi.mock("@/components/layout", () => ({
-  PageWrapper: ({ children }) => <div>{children}</div>,
-}));
-vi.mock("@/constants/env", () => ({
-  ENV_CONFIG: { IS_DEVELOPMENT: false },
-}));
-vi.mock("@/services/auth/loginWithScopeId", () => ({
-  loginWithScopeId: loginWithScopeIdMock,
-}));
-vi.mock("@/services/liffService", () => ({
-  liffService: liffServiceMock,
-}));
-vi.mock("@/services/logService", () => ({
-  logService: logServiceMock,
-}));
-vi.mock("@/state/global/authSlice", () => ({
-  setAuthenticated: (payload) => ({ type: "auth/setAuthenticated", payload }),
-  clearError: () => ({ type: "auth/clearError" }),
-}));
-vi.mock("@/utils/authUtils", () => ({
-  saveAuthToCookies: vi.fn(),
-}));
-vi.mock("@/utils/deviceUtils", () => ({
-  getDeviceData: () => ({ os: "ios" }),
-}));
-
-import ${pageExportName} from "${pageImportPath}";
-
-describe("${items[0]?.featureName ?? pageExportName}", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    selectorMock.mockReturnValue({ error: null });
-    liffServiceMock.initialize.mockResolvedValue(undefined);
-    liffServiceMock.isUserLoggedIn.mockReturnValue(true);
-    liffServiceMock.login.mockResolvedValue(undefined);
-    liffServiceMock.getUserProfile.mockResolvedValue({
-      userId: "U1234567890",
-      displayName: "Mock User",
-      pictureUrl: null,
-    });
-    liffServiceMock.getIdToken.mockResolvedValue("mock-id-token");
-    loginWithScopeIdMock.mockResolvedValue({
-      tokenId: "token-123",
-      accountId: "account-1",
-    });
-  });
-
-${AUTOGEN_START}
-${items.map((item) => buildAuthEntryFlowCaseBlock(item, pageExportName)).join("\n\n")}
-${AUTOGEN_END}
-
-${MANUAL_START}
-// custom cases
-${MANUAL_END}
-});
-`;
-}
-
-function buildAuthEntryFlowCaseBlock(item, pageExportName) {
-  if (item.scenarioType === "success") {
-    return `it("${item.title}", async () => {
-  render(<${pageExportName} />);
-  fireEvent.click(screen.getByRole("button", { name: "auth.agreeAndContinue" }));
-
-  await waitFor(() => {
-    expect(liffServiceMock.initialize).toHaveBeenCalled();
-  });
-});`;
-  }
-
-  if (item.scenarioType === "failure") {
-    return `it("${item.title}", async () => {
-  liffServiceMock.initialize.mockRejectedValue(new Error("LIFF init failed"));
-  render(<${pageExportName} />);
-  fireEvent.click(screen.getByRole("button", { name: "auth.agreeAndContinue" }));
-
-  await waitFor(() => {
-    expect(logServiceMock.error).toHaveBeenCalled();
-    expect(toastShowMock).toHaveBeenCalled();
-  });
-});`;
-  }
-
-  return `it("${item.title}", () => {
-  selectorMock.mockReturnValue({ error: "auth failed" });
-  render(<${pageExportName} />);
-
-  expect(screen.getByText("auth failed")).toBeInTheDocument();
-});`;
-}
-
-function buildRelativeImportPath(relativePath, targetPathWithoutExtension) {
-  const importPath = toPosixPath(
-    path.posix.relative(path.posix.dirname(relativePath), targetPathWithoutExtension),
-  );
-  return normalizeImportPath(importPath);
-}
-
-function deriveServiceExportName(sourceFile) {
-  const stem = path.basename(sourceFile, path.extname(sourceFile));
-  return stem.charAt(0).toLowerCase() + stem.slice(1);
-}
-
-function deriveComponentExportName(sourceFile) {
-  const stem = path.basename(sourceFile, path.extname(sourceFile));
-  return stem.charAt(0).toUpperCase() + stem.slice(1);
-}
-
-function inferLiffCompanionSourceFile(items, fallbackSourceFile) {
-  const liffTarget = items.find((item) => item.targetType === TARGET_TYPES.LIFF_ADAPTER_SERVICE && item.sourceFile);
-  return liffTarget?.sourceFile ?? "src/services/liffService.ts" ?? fallbackSourceFile;
-}
-
-function buildImportLines(relativePath, level, projectProfile) {
-  if (level === "e2e") {
-    return `import { test, expect } from "@playwright/test";`;
-  }
-
-  const testFramework = projectProfile.unitTestFramework === "jest" ? "jest" : "vitest";
-  const fixtureImportPath = toPosixPath(path.posix.relative(path.posix.dirname(relativePath), "testing/liff/applyFixture"));
-  return `import { describe, it, expect } from "${testFramework}";
-import { applyLiffFixture } from "${normalizeImportPath(fixtureImportPath)}";`;
-}
-
-function buildCaseBlock(item, level) {
-  const testFn = level === "e2e" ? "test" : "it";
-  const lines = [];
-  lines.push(`${testFn}("${item.title}", async () => {`);
-
-  if (level !== "e2e") {
-    lines.push(`  applyLiffFixture("${item.fixture}");`);
-    lines.push(`  expect("${item.featureId}").toBeTruthy();`);
-  } else {
-    lines.push(`  await page.goto("/");`);
-    lines.push(`  await expect(page).toHaveURL(/.*/);`);
-  }
-
-  for (const expected of item.expectedOutcome) {
-    lines.push(`  // ${expected}`);
-  }
-
-  lines.push(`});`);
-  return lines.join("\n");
-}
-
-function inferLevelFromOutputPath(relativePath) {
-  if (relativePath.includes("/e2e/")) {
-    return "e2e";
-  }
-  if (relativePath.includes("/integration/")) {
-    return "integration";
-  }
-  return "unit";
-}
-
-function normalizeImportPath(importPath) {
-  if (importPath.startsWith(".")) {
-    return importPath;
-  }
-  return `./${importPath}`;
-}
-
-function toPosixPath(value) {
-  return value.split(path.sep).join(path.posix.sep);
-}
-
-function extractAutogenBlock(content) {
-  const startIndex = content.indexOf(AUTOGEN_START);
-  const endIndex = content.indexOf(AUTOGEN_END);
-  return content.slice(startIndex, endIndex + AUTOGEN_END.length);
-}
-
-function extractManualBlock(content) {
-  const startIndex = content.indexOf(MANUAL_START);
-  const endIndex = content.indexOf(MANUAL_END);
-  if (startIndex === -1 || endIndex === -1) {
+  if (!builder || !sourceFile) {
     return null;
   }
-  return content.slice(startIndex, endIndex + MANUAL_END.length);
-}
 
-function replaceBlock(content, startMarker, endMarker, nextBlock) {
-  const startIndex = content.indexOf(startMarker);
-  const endIndex = content.indexOf(endMarker);
-
-  if (startIndex === -1 || endIndex === -1) {
-    return content;
-  }
-
-  const prefix = content.slice(0, startIndex);
-  const suffix = content.slice(endIndex + endMarker.length);
-  return `${prefix}${nextBlock}${suffix}`;
-}
-
-function mergeToolOwnedContent(currentContent, nextContent) {
-  const currentManualBlock = extractManualBlock(currentContent);
-  if (!currentManualBlock) {
-    return nextContent;
-  }
-
-  return replaceBlock(nextContent, MANUAL_START, MANUAL_END, currentManualBlock);
+  return builder(relativePath, items, sourceFile, {
+    TOOL_SIGNATURE,
+    AUTOGEN_START,
+    AUTOGEN_END,
+    MANUAL_START,
+    MANUAL_END,
+    buildRelativeImportPath,
+    deriveComponentExportName,
+    deriveServiceExportName,
+    inferLiffCompanionSourceFile,
+  }, projectProfile, level);
 }
 
 async function readTextFile(filePath) {
