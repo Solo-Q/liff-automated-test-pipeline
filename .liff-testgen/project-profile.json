@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1",
+  "repoPath": "/home/samlu/liff-automated-test-pipeline",
+  "packageManager": "npm",
+  "framework": "unknown",
+  "language": "js",
+  "monorepo": false,
+  "workspaces": [],
+  "targetWorkspace": null,
+  "unitTestFramework": null,
+  "e2eFramework": null,
+  "usesLiff": false,
+  "hasLiffMock": false,
+  "hasLiffAdapter": false
+}
